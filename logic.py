@@ -227,6 +227,11 @@ def normalizar_id_transaccion(val):
         pass
     return s
 
+def extraer_numeros(texto):
+    if not texto:
+        return []
+    return re.findall(r'\d+', str(texto))
+
 def obtener_turno_actual():
     hora = datetime.now().hour
 
@@ -1087,3 +1092,51 @@ class AuditManager:
         """Returns the list of cash movements for a vendor."""
         vendor = normalizar_texto(vendor)
         return self.datos_rendiciones.get(vendor, {}).get("movimientos", [])
+
+    def get_box_details(self, vendor_name):
+        """
+        Returns aggregated details (QR, Invoices, Returns, Annotations) for the box
+        associated with the given vendor (handling merged boxes).
+        """
+        state = self.vendor_states.get(normalizar_texto(vendor_name))
+        if not state:
+            return None
+
+        caja_id = state["caja_id"]
+
+        # Aggregate QR
+        dfs_qr = []
+        for v in caja_id:
+            df = self.datos_detalle_qr.get(v)
+            if df is not None and not df.empty:
+                dfs_qr.append(df)
+
+        df_qr_agg = pd.concat(dfs_qr, ignore_index=True) if dfs_qr else pd.DataFrame()
+
+        # Aggregate Fact (Product Details)
+        dfs_fact = []
+        for v in caja_id:
+            df = self.datos_detalle_facturacion.get(v)
+            if df is not None and not df.empty:
+                dfs_fact.append(df)
+
+        df_fact_agg = pd.concat(dfs_fact, ignore_index=True) if dfs_fact else pd.DataFrame()
+
+        # Aggregate Rendiciones
+        rend_agg = []
+        for v in caja_id:
+            movs = self.datos_rendiciones.get(v, {}).get("movimientos", [])
+            rend_agg.extend(movs)
+
+        # Aggregate Anotaciones
+        anot_agg = []
+        for a in self.anotaciones_tmp:
+            if normalizar_texto(a.get("vendedor")) in caja_id:
+                anot_agg.append(a)
+
+        return {
+            "qr": df_qr_agg,
+            "fact": df_fact_agg,
+            "rend": rend_agg,
+            "anot": anot_agg
+        }
