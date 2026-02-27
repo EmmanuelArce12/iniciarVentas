@@ -40,6 +40,11 @@ RESPONSABLES_GNC_VALIDOS = [
     "LUCAS MIRAGLIA",
 ]
 
+ALIAS_VENDEDORES_EXCEL = {
+    "REFOJOS OSVALDO": "BRIAN VEGA",
+    "MARLENE FLORENCIA GONZALEZ": "RODRIGO BREZESKY",
+}
+
 # -------------------------
 # ESTADOS QR (GLOBAL)
 # -------------------------
@@ -222,6 +227,11 @@ def normalizar_id_transaccion(val):
         pass
     return s
 
+def extraer_numeros(texto):
+    if not texto:
+        return []
+    return re.findall(r'\d+', str(texto))
+
 def obtener_turno_actual():
     hora = datetime.now().hour
 
@@ -289,6 +299,8 @@ class AuditManager:
 
         self.turno_seleccionado = None
         self.transaccion_qr_buscada = None
+
+        self.undo_stack = []
 
         # Vendor Input State (Replaces UI widgets)
         # Structure: vendor_name -> { 'base': float, 'prod': float, 'per': float,
@@ -921,3 +933,210 @@ class AuditManager:
         self.vendor_states[vendor_b]["fusionado"] = True
         # Note: In a pure logic class, we don't care about UI enabling/disabling.
         # Calculation logic will sum up everything for the unique caja_id.
+
+    def create_snapshot(self):
+        """Creates a deep copy of the current state for undo functionality."""
+        snapshot = {
+            "vendor_states": copy.deepcopy(self.vendor_states),
+            "datos_rendiciones": copy.deepcopy(self.datos_rendiciones),
+            "anotaciones_tmp": copy.deepcopy(self.anotaciones_tmp),
+            "qr_reasignados": copy.deepcopy(self.qr_reasignados),
+            "gnc_general_total": self.gnc_general_total,
+            "gnc_coberturas": copy.deepcopy(self.gnc_coberturas),
+            "gnc_total_coberturas": self.gnc_total_coberturas,
+            "gnc_para_caja": self.gnc_para_caja,
+            "gnc_extra_por_responsable": copy.deepcopy(self.gnc_extra_por_responsable)
+        }
+        self.undo_stack.append(snapshot)
+
+    def restore_snapshot(self):
+        """Restores the last state from the undo stack."""
+        if not self.undo_stack:
+            return False
+
+        snapshot = self.undo_stack.pop()
+        self.vendor_states = snapshot["vendor_states"]
+        self.datos_rendiciones = snapshot["datos_rendiciones"]
+        self.anotaciones_tmp = snapshot["anotaciones_tmp"]
+        self.qr_reasignados = snapshot["qr_reasignados"]
+        self.gnc_general_total = snapshot["gnc_general_total"]
+        self.gnc_coberturas = snapshot["gnc_coberturas"]
+        self.gnc_total_coberturas = snapshot["gnc_total_coberturas"]
+        self.gnc_para_caja = snapshot["gnc_para_caja"]
+        self.gnc_extra_por_responsable = snapshot["gnc_extra_por_responsable"]
+        return True
+
+    def undo(self):
+        """Undoes the last action."""
+        return self.restore_snapshot()
+
+    def process_excel_data(self, df_or_path):
+        """
+        Loads and processes Excel data to populate vendor states.
+        Handles aliases and initial amounts.
+        """
+        if isinstance(df_or_path, str):
+            # Attempt to read Excel file
+            try:
+                # Find header row dynamically
+                raw = pd.read_excel(df_or_path, header=None)
+                header_row = -1
+                col_importe = -1
+
+                for i, row in raw.iterrows():
+                    fila = row.astype(str).str.lower()
+                    if fila.str.contains('vendedor').any() and fila.str.contains('fecha').any():
+                        posibles = fila[fila.str.contains('importe|total|pesos', regex=True)]
+                        if not posibles.empty:
+                            header_row = i
+                            col_importe = posibles.index[0]
+                            break
+
+                if header_row == -1:
+                    raise ValueError("No se pudo detectar la fila de encabezados del Excel.")
+
+                df = pd.read_excel(df_or_path, header=header_row)
+                df.rename(columns={df.columns[col_importe]: 'Importe'}, inplace=True)
+
+                if 'Tipo de Venta' in df.columns:
+                    df = df[~df['Tipo de Venta'].astype(str).str.contains('YER', case=False, na=False)]
+
+                df['Importe'] = df['Importe'].apply(parse_moneda_robusto)
+
+            except Exception as e:
+                raise ValueError(f"Error procesando Excel: {e}")
+        else:
+            df = df_or_path
+
+        vendedores_excel = df.groupby("Vendedor")["Importe"].sum()
+
+        for vend, importe in vendedores_excel.items():
+            if not vend: continue
+
+            vend_norm = str(vend).strip().upper()
+            vend_final = ALIAS_VENDEDORES_EXCEL.get(vend_norm, vend_norm)
+
+            # Update or create vendor state
+            self.update_vendor_state(vend_final, base_excel=importe)
+
+            # Recalculate base
+            state = self.vendor_states[vend_final]
+            state["base"] = state["base_excel"] + state.get("gnc_base", 0.0) + state.get("gnc_asignado", 0.0)
+
+        # Re-apply annotations if needed
+        self.reconcile_anotaciones()
+
+    def set_card_amount(self, vendor, amount):
+        """Sets the credit card amount for a vendor."""
+        self.update_vendor_state(vendor, tarj=float(amount))
+
+    def add_manual_cash(self, vendor, amount):
+        """Adds a manual cash entry."""
+        vendor = normalizar_texto(vendor)
+        self.datos_rendiciones.setdefault(vendor, {}).setdefault("movimientos", []).append({
+            "origen": "manual",
+            "tipo": "Manual",
+            "monto": float(amount)
+        })
+
+    def update_manual_cash(self, vendor, index, new_amount):
+        """Updates a manual cash entry by index."""
+        vendor = normalizar_texto(vendor)
+        movs = self.datos_rendiciones.get(vendor, {}).get("movimientos", [])
+        if 0 <= index < len(movs):
+            movs[index]["monto"] = float(new_amount)
+
+    def remove_manual_cash(self, vendor, index):
+        """Removes a manual cash entry by index."""
+        vendor = normalizar_texto(vendor)
+        movs = self.datos_rendiciones.get(vendor, {}).get("movimientos", [])
+        if 0 <= index < len(movs):
+            movs.pop(index)
+
+    def register_gnc_responsible(self, name, amount=0.0):
+        """
+        Registers a new GNC responsible, potentially initializing them
+        if they don't exist in the current vendor states.
+        """
+        name = normalizar_texto(name)
+        if name not in self.vendor_states:
+            self.update_vendor_state(name, gnc_base=float(amount), gnc_aplicado=True)
+
+            # Recalculate base immediately
+            state = self.vendor_states[name]
+            state["base"] = state["base_excel"] + state["gnc_base"] + state["gnc_asignado"]
+
+            # Inject SQL GNC data if available
+            if self.df_gnc_sql_cache is not None and not self.df_gnc_sql_cache.empty:
+                for _, row in self.df_gnc_sql_cache.iterrows():
+                    vendedor_sql = str(row.get("Vendedor", "")).strip().upper()
+                    if son_nombres_similares(name, vendedor_sql):
+                        self.datos_rendiciones.setdefault(name, {}).setdefault("movimientos", []).append({
+                            "origen": "sql",
+                            "tipo": "GNC",
+                            "planilla": row.get("Planilla"),
+                            "nro": row.get("Nro_Mov"),
+                            "ref": f"GNC {row.get('Nro_Mov')} - {row.get('Fecha'):%d/%m %H:%M}",
+                            "monto": float(parse_moneda_robusto(row.get("Efectivo", 0)))
+                        })
+        else:
+            # Already exists, just update amount if needed?
+            # Logic from UI: check if already applied
+            state = self.vendor_states[name]
+            if not state.get("gnc_aplicado", False):
+                state["gnc_base"] = float(amount)
+                state["gnc_aplicado"] = True
+                state["base"] = state["base_excel"] + state["gnc_base"] + state["gnc_asignado"]
+
+    def get_vendor_movements(self, vendor):
+        """Returns the list of cash movements for a vendor."""
+        vendor = normalizar_texto(vendor)
+        return self.datos_rendiciones.get(vendor, {}).get("movimientos", [])
+
+    def get_box_details(self, vendor_name):
+        """
+        Returns aggregated details (QR, Invoices, Returns, Annotations) for the box
+        associated with the given vendor (handling merged boxes).
+        """
+        state = self.vendor_states.get(normalizar_texto(vendor_name))
+        if not state:
+            return None
+
+        caja_id = state["caja_id"]
+
+        # Aggregate QR
+        dfs_qr = []
+        for v in caja_id:
+            df = self.datos_detalle_qr.get(v)
+            if df is not None and not df.empty:
+                dfs_qr.append(df)
+
+        df_qr_agg = pd.concat(dfs_qr, ignore_index=True) if dfs_qr else pd.DataFrame()
+
+        # Aggregate Fact (Product Details)
+        dfs_fact = []
+        for v in caja_id:
+            df = self.datos_detalle_facturacion.get(v)
+            if df is not None and not df.empty:
+                dfs_fact.append(df)
+
+        df_fact_agg = pd.concat(dfs_fact, ignore_index=True) if dfs_fact else pd.DataFrame()
+
+        # Aggregate Rendiciones
+        rend_agg = []
+        for v in caja_id:
+            movs = self.datos_rendiciones.get(v, {}).get("movimientos", [])
+            rend_agg.extend(movs)
+
+        # Aggregate Anotaciones
+        anot_agg = []
+        for a in self.anotaciones_tmp:
+            if normalizar_texto(a.get("vendedor")) in caja_id:
+                anot_agg.append(a)
+
+        return {
+            "qr": df_qr_agg,
+            "fact": df_fact_agg,
+            "rend": rend_agg,
+            "anot": anot_agg
+        }
